@@ -1,9 +1,8 @@
 #pragma once
+#include "log.h"
 #include "resize_enabled_array.h"
 #include "threading/mpsc.h"
 #include "threading/unique_signal.h"
-#include "log.h"
-#include "log.h"
 #include "types.h"
 #include <chrono>
 #include <glm/glm.hpp>
@@ -79,28 +78,32 @@ struct QuitSignal;
 class WorkerThread {
   threading::mpsc_queue<RenderResult>
       &results; // reference to the queue in main thread to launch
-  threading::mpsc_queue<QuitSignal> quit;
   std::optional<std::thread> handle;
   utils::Log logger;
+  bool const &cancel;
   size_t worker_id;
 
 public:
-  WorkerThread(size_t id, threading::mpsc_queue<RenderResult> &results);
-  void cancel();
+  WorkerThread(size_t id, threading::mpsc_queue<RenderResult> &results,
+               bool const &cancel);
   void launch(RenderRequest request);
+  void drop_thread();
   ~WorkerThread();
 };
 
 class MainRenderThread {
   WorkerThread *threads = nullptr; // managed manually
-  utils::alloc::resize_enabled_array<u32> data = nullptr;
   threading::mpsc_queue<RenderResult> results;
+  utils::alloc::resize_enabled_array<u32> data = nullptr;
   double virtual_viewport_width;
   double virtual_viewport_height;
-  ray_tracer::World world;
   size_t jobs_left = 0;
   Timer timer;
   double last_render_time;
+  alignas(64) bool cancel_signal;
+  ray_tracer::World world;
+
+  void stop_pipeline();
 
 public:
   MainRenderThread();

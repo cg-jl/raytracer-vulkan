@@ -248,7 +248,7 @@ private:
 };
 } // namespace ray_tracer
 
-static constexpr size_t NUM_THREADS = 7;
+static constexpr size_t NUM_THREADS = 12;
 static constexpr size_t BLOCK_SIZE = 16;
 static constexpr size_t SAMPLES_PER_PIXEL = 100;
 
@@ -275,26 +275,18 @@ static vec3 color_at(double u, double v, double viewport_width,
   return ray_tracer::ray_color(ray, world, 50, random_engine);
 }
 
-struct QuitSignal {};
-
 WorkerThread::WorkerThread(size_t id,
-                           threading::mpsc_queue<RenderResult> &results)
-    : results(results), quit(1),
+                           threading::mpsc_queue<RenderResult> &results,
+                           bool const &cancel)
+    : results(results),
       logger((std::ostringstream() << "renderer::worker{" << id << '}').str()),
-      worker_id(id) {}
 
-void WorkerThread::cancel() {
-  if (handle) {
-    quit.blocking_emplace(QuitSignal{});
-    handle->join();
-    handle.reset();
-  }
-}
+      cancel(cancel), worker_id(id) {}
 
 void WorkerThread::launch(RenderRequest request) {
   logger.info() << "Received render request!\n";
-  auto &signal = quit;
   auto &sender = results;
+  auto const &signal = this->cancel;
   handle = std::thread([request, id = worker_id, &signal, &sender,
                         &workerlog = logger]() {
     std::mt19937 rand;
@@ -318,30 +310,31 @@ void WorkerThread::launch(RenderRequest request) {
         }
         *current = to_abgr(color / static_cast<double>(SAMPLES_PER_PIXEL));
       }
-      if (signal.try_pop()) {
-        workerlog.debug() << "Cancelled\n";
+      if (signal) {
+        workerlog.debug() << "Cancelling job!\n";
         return;
       }
     }
     // we've finished. Send a signal and spin until we're given a quit
     // message
     sender.blocking_emplace(RenderResult{id});
-    workerlog.debug() << "Emplaced result. Awaiting for quit signal...\n";
-    while (!signal.try_pop()) {
-      using namespace std::chrono_literals;
-      std::this_thread::sleep_for(10ms);
-    }
-    workerlog.debug() << "Received signal\n";
+    workerlog.debug() << "Emplaced result. Quitting...\n";
   });
 }
 
-WorkerThread::~WorkerThread() { cancel(); }
+void WorkerThread::drop_thread() {
+  if (handle) {
+    handle->join();
+    handle.reset();
+  }
+}
+WorkerThread::~WorkerThread() { drop_thread(); }
 
 MainRenderThread::MainRenderThread() : results(NUM_THREADS) {
   // initialize workers in idle state
   threads = (WorkerThread *)operator new[](sizeof(WorkerThread) * NUM_THREADS);
   for (size_t i = 0; i != NUM_THREADS; ++i) {
-    new (&threads[i]) WorkerThread(i, results);
+    new (&threads[i]) WorkerThread(i, results, this->cancel_signal);
   }
   virtual_viewport_width = 2.0;
 
@@ -354,14 +347,22 @@ MainRenderThread::MainRenderThread() : results(NUM_THREADS) {
   world.add(ray_tracer::Sphere{vec3(0.0, -100.5, -1.0), 100.0}, floor);
 }
 
+void MainRenderThread::stop_pipeline() {
+  mainlog.debug() << "Stopping pipeline, waiting for threads to join...\n";
+  cancel_signal = true;
+  for (size_t i = 0; i < NUM_THREADS; ++i) {
+    threads[i].drop_thread();
+  }
+  cancel_signal = false;
+}
+
 void MainRenderThread::on_resize(size_t width, size_t height) {
   virtual_viewport_height = virtual_viewport_width * height / width;
   mainlog.debug() << "Resized virtual viewport to " << virtual_viewport_width
                   << 'x' << virtual_viewport_height << '\n';
   mainlog.debug() << "Resized viewport to " << width << 'x' << height << '\n';
   // cancel the pipeline because I'm going to allocate the data array
-  for (size_t i = 0; i != NUM_THREADS; ++i)
-    threads[i].cancel();
+  stop_pipeline();
 
   // do the resizing
   data.resize(width * height);
@@ -384,8 +385,8 @@ bool MainRenderThread::on_frame_update() {
   if (jobs_left) {
     for (const RenderResult *res = nullptr;
          jobs_left && (res = results.try_pop()); --jobs_left) {
-      // end the thread to avoid spinning it.
-      threads[res->worker_id].cancel();
+      // Wait for thread to quit.
+      threads[res->worker_id].drop_thread();
     }
     if (!jobs_left) {
       last_render_time = timer.millis();
@@ -403,6 +404,8 @@ double MainRenderThread::get_last_render_time() const noexcept {
 }
 
 MainRenderThread::~MainRenderThread() {
+  if (jobs_left)
+    stop_pipeline();
   for (size_t i = 0; i != NUM_THREADS; ++i) {
     threads[i].~WorkerThread();
   }
