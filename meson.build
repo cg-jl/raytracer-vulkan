@@ -26,7 +26,7 @@ executable('raytracer', sources : [
 'threading/unique_signal.cc',
 'renderer.cc'
 ] + imgui_sources,
-include_directories : [include_directories('third-party'), inc_dirs, include_directories('third-party/imgui')],
+include_directories : [include_directories('third-party'), inc_dirs, include_directories('third-party/imgui'), include_directories('third-party/glm')],
 dependencies : [vulkan,  glfw])
 
 
